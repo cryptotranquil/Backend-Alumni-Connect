@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Browser clients use the Express API; only the trusted Admin SDK writes
+    // directly to Firestore.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

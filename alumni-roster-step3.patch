@@ -1,0 +1,575 @@
+diff --git a/API_COMPATIBILITY.md b/API_COMPATIBILITY.md
+--- a/API_COMPATIBILITY.md	2026-09-21 18:39:57.516539353 +0000
++++ b/API_COMPATIBILITY.md	2026-09-21 18:39:57.518156345 +0000
+@@ -34,3 +34,19 @@
+ - Expired or invalid session tokens get `401` with message `Token expired` / `Invalid token`.
+ - Password rules are enforced on `register`, `reset-password`, `profile/password`
+   and `admin/invite-admin`; violations are `400` with a message listing what is missing.
++
++## Alumni registration (roster)
++
++- `POST /api/register` with `role: "alumni"` now **requires** `registrationNumber` in the format
++  `BIT/24/BT/ME/009` (`400` otherwise). The stored number is the normalised form.
++- Number on the roster and unclaimed: `201 { user, token, expiresAt, pendingApproval: false }`.
++- Otherwise: `201 { user, token: null, pendingApproval: true, message }`. The frontend already
++  treats `pendingApproval: true` as "no session yet".
++- A pending alumnus can sign in; alumni-only routes return `403 "Your alumni account is pending admin approval."`.
++  The frontend should show a "waiting for approval" screen when `user.isApproved === false`.
++- Duplicate registration number: `409`.
++- `PUT /api/admin/approve-alumni/:id` records `approvalSource: "manual"`, and no longer re-notifies an
++  already-active alumnus.
++- `PUT /api/profile/update`: an alumnus who already has a registration number gets `400` if they try
++  to change it.
++
+diff --git a/README.md b/README.md
+--- a/README.md	2026-09-21 18:39:57.523529880 +0000
++++ b/README.md	2026-09-21 18:39:57.524991857 +0000
+@@ -120,6 +120,31 @@
+ issue a token include `expiresAt`. After that time the API answers `401 Token
+ expired`, and any open Socket.IO connection is closed.
+ 
++## Alumni registration and the roster
++
++Alumni are approved automatically when their registration number (like `BIT/24/BT/ME/009`) is on the
++alumni list an admin uploads (`/api/admin/alumni-roster`).
++
++1. An alumnus must give a registration number when registering (`400` if it is missing or in the
++   wrong format). Any spelling is accepted: `bit-24-bt-me-9` is treated as `BIT/24/BT/ME/009`.
++2. The number is looked up in `alumniRoster` and claimed in a transaction:
++   - **On the roster and unclaimed** -> `201`, account is **active**, a `token` is issued,
++     `approvalSource: "roster"`.
++   - **Anything else** -> `201`, account is **pending**, `pendingApproval: true`, `token: null`.
++     They can sign in, but alumni-only routes answer `403` "pending admin approval" until they are
++     approved: automatically when a later roster upload (or `POST /admin/alumni-roster/recheck-pending`)
++     contains their number, or by an admin with `PUT /api/admin/approve-alumni/:id`
++     (`approvalSource: "manual"`).
++   - **Number already registered** (any spelling) -> `409`.
++3. If creating the account fails, the roster entry is released. Deleting an alumnus account also
++   releases it. Alumni cannot change their registration number once it is set.
++
++Version 1 checks the number only (not the surname), so anyone who knows an alumnus's number could
++register with it first. An admin can delete such an account, which frees the entry.
++
++`docs/alumni-roster-schema.md` describes the collections. The Bruno collection has folders
++`15 Alumni Roster` (admin endpoints) and `16 Alumni Registration` (this flow).
++
+ ## Seeding
+ 
+ `npm run seed` ensures the five frontend-supported departments and eight
+diff --git a/integration/api.integration.js b/integration/api.integration.js
+--- a/integration/api.integration.js	2026-09-21 18:39:57.533049872 +0000
++++ b/integration/api.integration.js	2026-09-21 18:39:57.536702096 +0000
+@@ -78,6 +78,17 @@
+     assert.ok(studentAuth.token);
+     assert.equal(studentAuth.user.graduationYear, "2028");
+ 
++    // ── Alumni roster: numbers on the list are approved automatically ──────
++    const rosterService = require("../src/services/alumniRosterService");
++    const rosterRecord = (registrationNumber, fullName) => ({
++      registrationNumber, fullName, department: "Information Technology",
++      program: "Bachelor of Information Technology", graduationYear: "2023", email: "",
++    });
++    await rosterService.applyImport(
++      [rosterRecord("BIT/19/BT/NE/003", "Test Alumni"), rosterRecord("BIT/18/BT/NE/005", "Delete Me")],
++      { batchId: "integration" },
++    );
++
+     const alumniAuth = await request("POST", "/register", {
+       body: {
+         name: "Test Alumni",
+@@ -87,10 +98,16 @@
+         department: "Information Technology",
+         program: "Bachelor of Information Technology",
+         graduationYear: "2020",
++        registrationNumber: " bit/19/bt/ne/3 ", // any spelling of the roster number
+       },
+     });
+-    assert.ok(alumniAuth.token, "alumni registration must activate immediately");
++    assert.ok(alumniAuth.token, "a roster number must activate the account immediately");
+     assert.equal(alumniAuth.pendingApproval, false);
++    assert.equal(alumniAuth.user.isApproved, true);
++    const claimed = await rosterService.findByRegistrationNumber("BIT/19/BT/NE/003");
++    assert.equal(claimed.status, "claimed");
++    assert.equal(claimed.claimedBy, alumniAuth.user._id);
++
+ 
+     // ── Strong passwords ────────────────────────────────────────────────────
+     await assert.rejects(
+@@ -306,6 +323,90 @@
+     assert.equal(stats.connectionsCount, 1);
+     assert.equal(stats.eventsJoined, 1);
+ 
++    // ── Roster registration flow (kept last so the extra alumni do not change earlier results) ──
++    const alumniBody = (email, registrationNumber) => ({
++      name: "Other Alumni",
++      email,
++      password: "Alumni#12345",
++      role: "alumni",
++      department: "Information Technology",
++      program: "Bachelor of Information Technology",
++      graduationYear: "2021",
++      ...(registrationNumber === undefined ? {} : { registrationNumber }),
++    });
++
++    // Same number again (even spelled differently) is a duplicate.
++    await assert.rejects(
++      request("POST", "/register", { body: alumniBody("dup@example.com", "BIT-19-BT-NE-003") }),
++      /409/,
++    );
++    // A registration number is required, and must have the right shape.
++    await assert.rejects(request("POST", "/register", { body: alumniBody("nonum@example.com") }), /400.*required for alumni/s);
++    await assert.rejects(request("POST", "/register", { body: alumniBody("oldfmt@example.com", "BSE/20/001") }), /400.*BIT\/24\/BT\/ME\/009/s);
++
++    // Not on the roster: account is created pending, with no session.
++    const pendingReg = await request("POST", "/register", {
++      body: alumniBody("pending@example.com", "BIT/17/BT/NE/044"),
++    });
++    assert.equal(pendingReg.pendingApproval, true);
++    assert.equal(pendingReg.token, null);
++    assert.equal(pendingReg.user.isApproved, false);
++
++    // They can sign in (2FA) but are blocked from alumni-only areas until approved.
++    const pendingChallenge = await request("POST", "/login", {
++      body: { email: "pending@example.com", password: "Alumni#12345" },
++    });
++    const pendingSession = await request("POST", "/login/verify-2fa", {
++      body: { twoFactorToken: pendingChallenge.twoFactorToken, code: pendingChallenge.devCode },
++    });
++    await assert.rejects(
++      request("GET", "/directory/alumni", { token: pendingSession.token }),
++      /403.*pending admin approval/s,
++    );
++
++    // An admin approves them; access opens up straight away and the source is recorded.
++    const approved = await request("PUT", `/admin/approve-alumni/${pendingReg.user._id}`, {
++      token: adminAuth.token,
++    });
++    assert.equal(approved.isApproved, true);
++    assert.equal(approved.approvalSource, "manual");
++    await request("GET", "/directory/alumni", { token: pendingSession.token });
++
++    // Registration number is fixed once set.
++    await assert.rejects(
++      request("PUT", "/profile/update", {
++        token: pendingSession.token,
++        body: { registrationNumber: "BIT/19/BT/NE/003" },
++      }),
++      /400.*can't be changed/s,
++    );
++
++    // Deleting an alumnus frees their roster entry.
++    const deleteMe = await request("POST", "/register", {
++      body: alumniBody("deleteme@example.com", "BIT/18/BT/NE/005"),
++    });
++    assert.equal(deleteMe.pendingApproval, false);
++    assert.equal((await rosterService.findByRegistrationNumber("BIT/18/BT/NE/005")).status, "claimed");
++    await request("DELETE", `/admin/users/${deleteMe.user._id}`, { token: adminAuth.token });
++    assert.equal((await rosterService.findByRegistrationNumber("BIT/18/BT/NE/005")).status, "unclaimed");
++
++    // A pending alumnus is approved automatically once their number is added to the roster.
++    const late = await request("POST", "/register", {
++      body: alumniBody("late@example.com", "BIT/16/BT/NE/070"),
++    });
++    assert.equal(late.pendingApproval, true);
++    await request("POST", "/admin/alumni-roster", {
++      token: adminAuth.token,
++      body: { registrationNumber: "BIT/16/BT/NE/070", fullName: "Late Listed" },
++    });
++    const recheck = await request("POST", "/admin/alumni-roster/recheck-pending", {
++      token: adminAuth.token,
++    });
++    assert.ok(recheck.result.approvedUsers.some((u) => u.id === late.user._id));
++    const lateEntry = await rosterService.findByRegistrationNumber("BIT/16/BT/NE/070");
++    assert.equal(lateEntry.status, "claimed");
++    assert.equal(lateEntry.claimedBy, late.user._id);
++
+     console.log("End-to-end API integration checks passed.");
+   } finally {
+     await new Promise((resolve) => server.close(resolve));
+diff --git a/scripts/initFirestoreSchema.js b/scripts/initFirestoreSchema.js
+--- a/scripts/initFirestoreSchema.js	2026-09-21 18:39:57.543136466 +0000
++++ b/scripts/initFirestoreSchema.js	2026-09-21 18:39:57.544557299 +0000
+@@ -41,7 +41,7 @@
+ const userService = require("../src/services/userService");
+ const { checkPassword } = require("../src/utils/passwordPolicy");
+ 
+-const SCHEMA_VERSION = "2026-09-20";
++const SCHEMA_VERSION = "2026-09-21";
+ 
+ // Mirrors the "Collection map" table in alumni-connect-firestore-schema.md.
+ // Keep the two in sync if you add or rename a collection.
+@@ -67,6 +67,8 @@
+   { name: "businesses", purpose: "Alumni business directory" },
+   { name: "businessReviews", purpose: "Reviews on a business, moderated" },
+   { name: "auditLogs", purpose: "Admin action log" },
++  { name: "alumniRoster", purpose: "Official alumni list keyed by registration number (BIT-24-BT-ME-009); a match at registration auto-approves the alumnus" },
++  { name: "rosterImports", purpose: "History of alumni-list uploads (who, when, file name, counts)" },
+ ];
+ 
+ async function writeSchemaManifest() {
+diff --git a/scripts/seedCollections.js b/scripts/seedCollections.js
+--- a/scripts/seedCollections.js	2026-09-21 18:39:57.549729899 +0000
++++ b/scripts/seedCollections.js	2026-09-21 18:39:57.551126350 +0000
+@@ -5,7 +5,7 @@
+  *
+  * Why sample documents: Firestore has no such thing as an empty collection.
+  * A collection only shows up in the console once it holds at least one
+- * document, so this is the only way to see all 21 collections up front.
++ * document, so this is the only way to see all 23 collections up front.
+  * (`npm run seed` already created `departments` and `groups`.)
+  *
+  * What it creates (all with fixed `seed-...` IDs, so re-running just
+@@ -14,7 +14,7 @@
+  *   groupMemberships, posts, mentorshipRequests, mentorshipMatches,
+  *   mentorshipOffers, conversations (+ messages subcollection),
+  *   notifications, follows, recommendations, skillEndorsements,
+- *   businesses, businessReviews, auditLogs
++ *   businesses, businessReviews, auditLogs, alumniRoster, rosterImports
+  *
+  * Skipped on purpose: `profiles`. The schema marks it legacy/dead (nothing
+  * writes to it), so seeding it would only add clutter.
+@@ -31,6 +31,10 @@
+ require("dotenv").config({ path: require("path").join(__dirname, "../.env") });
+ 
+ const crypto = require("crypto");
++const {
++  parseRegistrationNumber,
++  toDocId,
++} = require("../src/utils/registrationNumber");
+ 
+ // Same hashing the services use for deterministic IDs (see eventService,
+ // groupService, jobService, socialService).
+@@ -87,6 +91,8 @@
+     department: "Software Engineering",
+     program: "BSc Software Engineering",
+     campus: "LL",
++    registrationNumber: "BSE/16/LL/NE/004",
++    approvalSource: "roster", // number was on the alumni roster
+     graduationYear: "2020",
+     university: "Sample University",
+     company: "Sample Telecom",
+@@ -111,6 +117,8 @@
+     department: "Accounting & Finance",
+     program: "BSc Accounting",
+     campus: "BT",
++    registrationNumber: "BAF/14/BT/NE/011",
++    approvalSource: "manual", // not on the roster; an admin approved by hand
+     graduationYear: "2018",
+     university: "Sample University",
+     company: "Sample Bank",
+@@ -446,6 +454,75 @@
+     ...stamp(daysFromNow(-1)),
+   });
+ 
++  // ── alumniRoster + rosterImports ─────────────────────────────────────────
++  // Same shape and IDs as services/alumniRosterService (ID = number with "/" -> "-").
++  const importedAt = daysFromNow(-30);
++  const rosterEntry = (registrationNumber, fields, claimedBy = null) => {
++    const parts = parseRegistrationNumber(registrationNumber);
++    add(`alumniRoster/${toDocId(parts.normalized)}`, {
++      registrationNumber: parts.normalized,
++      fullName: fields.fullName,
++      department: fields.department || "",
++      program: fields.program || "",
++      graduationYear: fields.graduationYear || "",
++      email: (fields.email || "").toLowerCase(),
++      programCode: parts.programCode,
++      admissionYear: parts.admissionYear,
++      locationCode: parts.locationCode,
++      entryType: parts.entryType,
++      sequence: parts.sequence,
++      status: claimedBy ? "claimed" : "unclaimed",
++      claimedBy,
++      claimedAt: claimedBy ? daysFromNow(-50) : null,
++      importBatchId: "seed-import-1",
++      createdAt: importedAt,
++      updatedAt: claimedBy ? daysFromNow(-50) : importedAt,
++    });
++  };
++
++  rosterEntry(
++    "BSE/16/LL/NE/004",
++    {
++      fullName: "Chikondi Banda",
++      department: "Software Engineering",
++      program: "BSc Software Engineering",
++      graduationYear: "2020",
++      email: "chikondi.banda.sample@example.com",
++    },
++    U.alumni1,
++  );
++  rosterEntry("BIT/21/BT/ME/009", {
++    fullName: "Tamanda Phiri",
++    department: "Information Technology",
++    program: "BSc Information Technology",
++    graduationYear: "2024",
++  });
++  rosterEntry("BIT/20/BT/NE/012", {
++    fullName: "Yamikani Mwale",
++    department: "Information Technology",
++    program: "BSc Information Technology",
++    graduationYear: "2024",
++    email: "yamikani.mwale.sample@example.com",
++  });
++  rosterEntry("BBA/19/LL/NE/015", {
++    fullName: "Limbani Chirwa",
++    department: "Business Management",
++    program: "BCom Business Management",
++    graduationYear: "2023",
++  });
++
++  add("rosterImports/seed-import-1", {
++    fileName: "alumni-list-sample.xlsx",
++    uploadedBy: U.admin,
++    uploadedByEmail: "admin.sample@example.com",
++    totalRows: 4,
++    errorRows: 0,
++    created: 4,
++    updated: 0,
++    skippedClaimed: 0,
++    createdAt: importedAt,
++  });
++
+   // ── auditLogs ────────────────────────────────────────────────────────────
+   add("auditLogs/seed-audit-1", {
+     actorId: U.admin,
+diff --git a/src/controllers/adminController.js b/src/controllers/adminController.js
+--- a/src/controllers/adminController.js	2026-09-21 18:39:57.556496150 +0000
++++ b/src/controllers/adminController.js	2026-09-21 18:39:57.557995708 +0000
+@@ -4,6 +4,7 @@
+ const auditLogService = require("../services/auditLog.service");
+ const notificationService = require("../services/notification.service");
+ const formatUser = require("../utils/formatUser");
++const { releaseForDeletedUser } = require("../services/alumniRegistration");
+ const { serialize } = require("../utils/serialize");
+ const { generatePlainToken, hashToken } = require("../utils/tokenCrypto");
+ const { sendTransactionalEmail, frontendBaseUrl } = require("../services/email.service");
+@@ -20,6 +21,8 @@
+     }
+   }
+   await userService.deleteUser(target.id);
++  // Free the alumni-roster entry so the real owner can register with that number.
++  await releaseForDeletedUser(target);
+   res.json({ success: true, message: "User deleted" });
+ };
+ 
+@@ -27,7 +30,16 @@
+   const user = await userService.findById(req.params.id);
+   if (!user || user.role !== "alumni") return res.status(404).json({ success: false, message: "Alumni user not found" });
+ 
+-  await userService.updateUser(req.params.id, { accountStatus: "active" });
++  // Already active (for example approved automatically from the alumni roster):
++  // nothing to change and no second notification.
++  if (user.accountStatus === "active") return res.json(formatUser(user));
++
++  await userService.updateUser(req.params.id, {
++    accountStatus: "active",
++    approvalSource: "manual",
++    approvedBy: req.user.userId,
++    approvedAt: new Date(),
++  });
+   const updated = await userService.findById(req.params.id);
+ 
+   try { await notificationService.notifyAlumniApproved(updated); }
+diff --git a/src/controllers/authController.js b/src/controllers/authController.js
+--- a/src/controllers/authController.js	2026-09-21 18:39:57.563098908 +0000
++++ b/src/controllers/authController.js	2026-09-21 18:39:57.564520940 +0000
+@@ -7,6 +7,11 @@
+   tokenExpiry,
+ } = require("../utils/generateToken");
+ const twoFactorService = require("../services/twoFactor.service");
++const {
++  checkRegistrationNumber,
++  decideAlumniRegistration,
++  undoClaim,
++} = require("../services/alumniRegistration");
+ const { maskEmail, CODE_TTL_MS } = require("../utils/twoFactorCode");
+ const formatUser = require("../utils/formatUser");
+ const { generatePlainToken, hashToken } = require("../utils/tokenCrypto");
+@@ -102,10 +107,18 @@
+       .status(409)
+       .json({ success: false, message: "Email already registered" });
+   }
+-  if (
+-    registrationNumber &&
+-    (await userService.findByRegistrationNumber(registrationNumber))
+-  ) {
++
++  // Alumni are matched against the alumni roster by a normalised registration
++  // number (BIT/24/BT/ME/009), so the duplicate check uses that form too.
++  let regNumber = registrationNumber;
++  if (role === "alumni") {
++    const checked = checkRegistrationNumber(registrationNumber);
++    if (!checked.ok) {
++      return res.status(400).json({ success: false, message: checked.message });
++    }
++    regNumber = checked.registrationNumber;
++  }
++  if (regNumber && (await userService.findByRegistrationNumber(regNumber))) {
+     return res.status(409).json({
+       success: false,
+       message: "That registration number is already registered",
+@@ -145,31 +158,73 @@
+   }
+ 
+   const { firstname, lastname } = splitName(name);
+-  const user = await userService.createUser({
+-    firstname,
+-    lastname,
+-    email,
+-    password,
+-    role,
+-    phone: phone || "",
+-    graduationYear:
+-      graduationYear || inferredGraduationYear(registrationNumber),
+-    university: university || "Exploits University",
+-    company: company || "",
+-    position: position || "",
+-    registrationNumber:
+-      role === "student" ? registrationNumber : registrationNumber || "",
+-    department: department || (role === "admin" ? "Administration" : ""),
+-    program: program || "",
+-    campus: campus || "",
+-    skills: [],
+-    interests: [],
+-    bio: "",
+-    profilePhoto: "",
+-    coverPhoto: "",
+-    accountStatus: "active",
+-    mustChangePassword: false,
+-  });
++
++  // Alumni: claim the roster entry first. Found and free -> active now;
++  // otherwise the account is created pending for an admin to approve.
++  const userId = userService.newUserId();
++  const decision =
++    role === "alumni"
++      ? await decideAlumniRegistration({ registrationNumber: regNumber, userId })
++      : null;
++
++  if (
++    decision?.reason === "already_claimed" &&
++    (await userService.findByRegistrationNumber(regNumber))
++  ) {
++    // Someone else registered with this number a moment ago.
++    return res.status(409).json({
++      success: false,
++      message: "That registration number is already registered",
++    });
++  }
++
++  let user;
++  try {
++    user = await userService.createUser({
++      id: userId,
++      firstname,
++      lastname,
++      email,
++      password,
++      role,
++      phone: phone || "",
++      graduationYear:
++        graduationYear || inferredGraduationYear(registrationNumber),
++      university: university || "Exploits University",
++      company: company || "",
++      position: position || "",
++      registrationNumber:
++        role === "student" ? registrationNumber : regNumber || "",
++      department: department || (role === "admin" ? "Administration" : ""),
++      program: program || "",
++      campus: campus || "",
++      skills: [],
++      interests: [],
++      bio: "",
++      profilePhoto: "",
++      coverPhoto: "",
++      accountStatus: decision ? decision.accountStatus : "active",
++      approvalSource: decision?.approvalSource || undefined,
++      mustChangePassword: false,
++    });
++  } catch (error) {
++    // Do not leave the roster entry locked to an account that was never created.
++    if (decision?.claimed) {
++      await undoClaim({ registrationNumber: decision.registrationNumber, userId });
++    }
++    throw error;
++  }
++
++  if (user.accountStatus !== "active") {
++    return res.status(201).json({
++      success: true,
++      user: formatUser(user),
++      token: null,
++      pendingApproval: true,
++      message:
++        "Your registration number was not found in the alumni list, so an administrator will review your account. You can sign in once it is approved.",
++    });
++  }
+ 
+   return res
+     .status(201)
+diff --git a/src/controllers/userController.js b/src/controllers/userController.js
+--- a/src/controllers/userController.js	2026-09-21 18:39:57.569919800 +0000
++++ b/src/controllers/userController.js	2026-09-21 18:39:57.571406693 +0000
+@@ -1,4 +1,8 @@
+ const userService = require("../services/userService");
++const { parseRegistrationNumber } = require("../utils/registrationNumber");
++
++// Canonical form of a registration number, or "" when it is not a valid one.
++const canonicalNumber = (value) => parseRegistrationNumber(value)?.normalized || "";
+ const jobService = require("../services/jobService");
+ const eventService = require("../services/eventService");
+ const mentorshipService = require("../services/mentorshipService");
+@@ -125,6 +129,25 @@
+     updates.lastname = rest.join(" ");
+   }
+ 
++  // An alumnus's registration number is what got them approved, so once it is
++  // set it is fixed. (Sending the same value back is fine.)
++  if (
++    updates.registrationNumber &&
++    req.user.role === "alumni" &&
++    req.user.doc?.registrationNumber
++  ) {
++    const current = canonicalNumber(req.user.doc.registrationNumber);
++    const requested = canonicalNumber(updates.registrationNumber);
++    if (requested !== current) {
++      return res.status(400).json({
++        success: false,
++        message:
++          "Your registration number can't be changed. Contact an administrator if it is wrong.",
++      });
++    }
++    delete updates.registrationNumber;
++  }
++
+   if (updates.registrationNumber) {
+     const existing = await userService.findByRegistrationNumber(
+       updates.registrationNumber,
+diff --git a/src/services/userService.js b/src/services/userService.js
+--- a/src/services/userService.js	2026-09-21 18:39:57.576753231 +0000
++++ b/src/services/userService.js	2026-09-21 18:39:57.578296272 +0000
+@@ -59,8 +59,13 @@
+   return expires > new Date() ? user : null;
+ }
+ 
+-async function createUser(data) {
+-  const id = usersRef.doc().id;
++/** Reserve an ID before the user exists (registration claims a roster entry for it first). */
++function newUserId() {
++  return usersRef.doc().id;
++}
++
++async function createUser({ id: presetId, ...data }) {
++  const id = presetId || usersRef.doc().id;
+   const now = new Date();
+   const hashedPassword = await bcrypt.hash(data.password, 12);
+   const doc = cleanObject({
+@@ -130,6 +135,7 @@
+ }
+ 
+ module.exports = {
++  newUserId,
+   countUsers,
+   findByEmail,
+   findByRegistrationNumber,

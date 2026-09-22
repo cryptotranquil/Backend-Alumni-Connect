@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+serviceAccountKey.json
+*serviceAccount*.json
+*-firebase-adminsdk-*.json
+
+# Firebase / Google credential files anywhere in the repo
+**/serviceAccountKey.json
+**/google-credentials.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Firebase emulator logs and exported local data
+*-debug.log
+.firebase/
+firestore-export/
