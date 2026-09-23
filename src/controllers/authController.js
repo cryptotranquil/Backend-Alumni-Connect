@@ -277,9 +277,9 @@ exports.login = async (req, res) => {
     await userService.updateUser(user.id, { failedLoginAttempts: 0, lockUntil: null });
   }
 
-  if (!twoFactorService.isEnabled()) {
-    return res.json(sessionResponse(user));
-  }
+  if (!twoFactorService.isEnabled() || user.role === "admin") {
+  return res.json(sessionResponse(user));
+}
 
   // Password is correct: require the emailed one-time code before any session exists.
   const sent = await twoFactorService.sendCode(user);

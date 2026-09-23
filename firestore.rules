@@ -1,8 +1,12 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Browser clients use the Express API; only the trusted Admin SDK writes
-    // directly to Firestore.
+    // Browser/mobile clients never talk to Firestore directly — they go
+    // through the Express API, which uses the Admin SDK (service account)
+    // and is not subject to these rules. This file exists purely to block
+    // anyone from hitting Firestore straight from a client SDK using the
+    // public Firebase project config (project id, API key, etc. are not
+    // secret, so this is the actual security boundary for direct access).
     match /{document=**} {
       allow read, write: if false;
     }
