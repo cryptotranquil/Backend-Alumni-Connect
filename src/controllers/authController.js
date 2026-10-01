@@ -19,6 +19,13 @@ const {
   sendTransactionalEmail,
   frontendBaseUrl,
 } = require("../services/email.service");
+const {
+  TRUST_HOURS,
+  generateDeviceToken,
+  hashDeviceToken,
+  expiryDate,
+  prune,
+} = require("../utils/trustedDevice");
 
 // Per-account lockout, separate from the per-IP rate limiter in server.js:
 // that limiter (100 requests / 15 min) is shared by every account behind one
@@ -30,7 +37,9 @@ const ACCOUNT_LOCK_MINUTES = Number(process.env.ACCOUNT_LOCK_MINUTES) || 15;
 
 function lockExpiry(user) {
   if (!user.lockUntil) return null;
-  const expiry = user.lockUntil?.toDate ? user.lockUntil.toDate() : new Date(user.lockUntil);
+  const expiry = user.lockUntil?.toDate
+    ? user.lockUntil.toDate()
+    : new Date(user.lockUntil);
   return expiry > new Date() ? expiry : null;
 }
 
@@ -65,7 +74,9 @@ function twoFactorChallenge(user, sent) {
 }
 
 function splitName(name) {
-  const [firstname, ...rest] = String(name || "").trim().split(/\s+/);
+  const [firstname, ...rest] = String(name || "")
+    .trim()
+    .split(/\s+/);
   return { firstname, lastname: rest.join(" ") };
 }
 
@@ -164,7 +175,10 @@ exports.register = async (req, res) => {
   const userId = userService.newUserId();
   const decision =
     role === "alumni"
-      ? await decideAlumniRegistration({ registrationNumber: regNumber, userId })
+      ? await decideAlumniRegistration({
+          registrationNumber: regNumber,
+          userId,
+        })
       : null;
 
   if (
@@ -210,7 +224,10 @@ exports.register = async (req, res) => {
   } catch (error) {
     // Do not leave the roster entry locked to an account that was never created.
     if (decision?.claimed) {
-      await undoClaim({ registrationNumber: decision.registrationNumber, userId });
+      await undoClaim({
+        registrationNumber: decision.registrationNumber,
+        userId,
+      });
     }
     throw error;
   }
@@ -247,7 +264,8 @@ exports.login = async (req, res) => {
     if (lockedUntil) {
       return res.status(429).json({
         success: false,
-        message: "Too many failed attempts on this account. Please try again later.",
+        message:
+          "Too many failed attempts on this account. Please try again later.",
         retryAfterSeconds: Math.ceil((lockedUntil - Date.now()) / 1000),
       });
     }
@@ -259,7 +277,9 @@ exports.login = async (req, res) => {
       const patch = { failedLoginAttempts: attempts };
       if (attempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
         patch.failedLoginAttempts = 0;
-        patch.lockUntil = new Date(Date.now() + ACCOUNT_LOCK_MINUTES * 60 * 1000);
+        patch.lockUntil = new Date(
+          Date.now() + ACCOUNT_LOCK_MINUTES * 60 * 1000,
+        );
       }
       await userService.updateUser(user.id, patch);
     }
@@ -274,14 +294,29 @@ exports.login = async (req, res) => {
   }
 
   if (user.failedLoginAttempts || user.lockUntil) {
-    await userService.updateUser(user.id, { failedLoginAttempts: 0, lockUntil: null });
+    await userService.updateUser(user.id, {
+      failedLoginAttempts: 0,
+      lockUntil: null,
+    });
   }
 
-  if (!twoFactorService.isEnabled() || user.role === "admin") {
-  return res.json(sessionResponse(user));
-}
+  const trustedToken = req.body.trustedDeviceToken;
+  const storedDevices = Array.isArray(user.trustedDevices)
+    ? user.trustedDevices
+    : [];
+  const activeDevices = prune(storedDevices);
+  const trustHash = trustedToken ? hashDeviceToken(trustedToken) : null;
+  const isTrusted =
+    !!trustHash && activeDevices.some((d) => d.tokenHash === trustHash);
 
-  // Password is correct: require the emailed one-time code before any session exists.
+  if (activeDevices.length !== storedDevices.length) {
+    await userService.updateUser(user.id, { trustedDevices: activeDevices });
+  }
+
+  if (!twoFactorService.isEnabled() || user.role === "admin" || isTrusted) {
+    return res.json(sessionResponse(user));
+  }
+
   const sent = await twoFactorService.sendCode(user);
   if (!sent.ok) {
     return res.status(503).json({
@@ -322,8 +357,29 @@ exports.verifyTwoFactor = async (req, res) => {
 
   const result = await twoFactorService.verifyCode(user.id, req.body.code);
   switch (result.status) {
-    case "ok":
-      return res.json(sessionResponse(user));
+    case "ok": {
+      // Correct code: mint a trusted-device token valid for TRUST_HOURS.
+      const deviceToken = generateDeviceToken();
+      const entry = {
+        tokenHash: hashDeviceToken(deviceToken),
+        expiresAt: expiryDate(),
+        createdAt: new Date(),
+        userAgent: String(req.header("User-Agent") || "").slice(0, 200),
+      };
+
+      const existing = prune(user.trustedDevices || []).slice(-9);
+      await userService.updateUser(user.id, {
+        trustedDevices: [...existing, entry],
+      });
+
+      return res.json(
+        sessionResponse(user, {
+          trustedDeviceToken: deviceToken,
+          trustedDeviceExpiresAt: entry.expiresAt.toISOString(),
+          trustedDeviceHours: TRUST_HOURS,
+        }),
+      );
+    }
     case "invalid":
       return res.status(401).json({
         success: false,
